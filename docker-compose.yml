@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  crawl4ai-mcp:
+    build: .
+    ports:
+      - "8051:8051"
+    env_file:
+      - .env
+    volumes:
+      - ./chroma_db/:/app/chroma_data/

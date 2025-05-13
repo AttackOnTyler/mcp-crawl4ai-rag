@@ -5,69 +5,63 @@ import os
 import concurrent.futures
 from typing import List, Dict, Any, Optional, Tuple
 import json
-from supabase import create_client, Client
+# Removed: from supabase import create_client, Client
 from urllib.parse import urlparse
 import openai
+import chromadb
+from chromadb.utils import embedding_functions
+from more_itertools import batched # Added for batching ChromaDB inserts
 
-# Load OpenAI API key for embeddings
+# Load OpenAI API key for contextual embeddings
+# Note: Primary vector embeddings are handled by ChromaDB's configured embedding function
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def get_supabase_client() -> Client:
+def get_chroma_client(persist_directory: str = "./chroma_db_mcp") -> chromadb.PersistentClient:
     """
-    Get a Supabase client with the URL and key from environment variables.
-    
-    Returns:
-        Supabase client instance
-    """
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_SERVICE_KEY")
-    
-    if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
-    
-    return create_client(url, key)
-
-def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
-    """
-    Create embeddings for multiple texts in a single API call.
+    Get a ChromaDB client with the specified persistence directory.
     
     Args:
-        texts: List of texts to create embeddings for
+        persist_directory: Directory where ChromaDB will store its data (defaults to ./chroma_db_mcp)
         
     Returns:
-        List of embeddings (each embedding is a list of floats)
+        A ChromaDB PersistentClient
     """
-    if not texts:
-        return []
-        
+    # Use environment variable if set, otherwise use default
+    db_path = os.getenv("CHROMA_DB_PATH", persist_directory)
+    
+    # Create the directory if it doesn't exist
+    os.makedirs(db_path, exist_ok=True)
+    
+    # Return the client
+    return chromadb.PersistentClient(db_path)
+
+def get_or_create_collection(
+    client: chromadb.PersistentClient,
+    collection_name: str,
+    embedding_model_name: str = "all-MiniLM-L6-v2", # Using a local SentenceTransformer model
+    distance_function: str = "cosine",
+) -> chromadb.Collection:
+    """Get an existing collection or create a new one if it doesn't exist."""
+    # Create embedding function using a local model
+    embedding_func = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=embedding_model_name
+    )
+    
+    # Try to get the collection, create it if it doesn't exist
     try:
-        response = openai.embeddings.create(
-            model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
-            input=texts
+        return client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_func # Assign the embedding function
         )
-        return [item.embedding for item in response.data]
-    except Exception as e:
-        print(f"Error creating batch embeddings: {e}")
-        # Return empty embeddings if there's an error
-        return [[0.0] * 1536 for _ in range(len(texts))]
+    except Exception:
+        print(f"Collection '{collection_name}' not found. Creating new collection.")
+        return client.create_collection(
+            name=collection_name,
+            embedding_function=embedding_func, # Assign the embedding function
+            metadata={"hnsw:space": distance_function}
+        )
 
-def create_embedding(text: str) -> List[float]:
-    """
-    Create an embedding for a single text using OpenAI's API.
-    
-    Args:
-        text: Text to create an embedding for
-        
-    Returns:
-        List of floats representing the embedding
-    """
-    try:
-        embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * 1536
-    except Exception as e:
-        print(f"Error creating embedding: {e}")
-        # Return empty embedding if there's an error
-        return [0.0] * 1536
+# Removed: create_embeddings_batch and create_embedding functions
 
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
@@ -84,6 +78,11 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
     """
     model_choice = os.getenv("MODEL_CHOICE")
     
+    # Only attempt contextual embedding if MODEL_CHOICE and OPENAI_API_KEY are set
+    if not model_choice or not openai.api_key:
+        # print("MODEL_CHOICE or OPENAI_API_KEY not set. Skipping contextual embedding.")
+        return chunk, False # Return original chunk and False flag
+        
     try:
         # Create the prompt for generating contextual information
         prompt = f"""<document> 
@@ -134,137 +133,111 @@ def process_chunk_with_context(args):
     url, content, full_document = args
     return generate_contextual_embedding(full_document, content)
 
-def add_documents_to_supabase(
-    client: Client, 
+def add_documents_to_chroma(
+    collection: chromadb.Collection, 
     urls: List[str], 
     chunk_numbers: List[int],
     contents: List[str], 
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
-    batch_size: int = 20
+    batch_size: int = 100 # Increased batch size for ChromaDB
 ) -> None:
     """
-    Add documents to the Supabase crawled_pages table in batches.
-    Deletes existing records with the same URLs before inserting to prevent duplicates.
+    Add documents to a ChromaDB collection in batches.
     
     Args:
-        client: Supabase client
+        collection: ChromaDB collection
         urls: List of URLs
         chunk_numbers: List of chunk numbers
         contents: List of document contents
         metadatas: List of document metadata
         url_to_full_document: Dictionary mapping URLs to their full document content
-        batch_size: Size of each batch for insertion
+        batch_size: Size of batches for adding documents
     """
-    # Get unique URLs to delete existing records
-    unique_urls = list(set(urls))
-    
-    # Delete existing records for these URLs in a single operation
-    try:
-        if unique_urls:
-            # Use the .in_() filter to delete all records with matching URLs
-            client.table("crawled_pages").delete().in_("url", unique_urls).execute()
-    except Exception as e:
-        print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
-        # Fallback: delete records one by one
-        for url in unique_urls:
-            try:
-                client.table("crawled_pages").delete().eq("url", url).execute()
-            except Exception as inner_e:
-                print(f"Error deleting record for URL {url}: {inner_e}")
-                # Continue with the next URL even if one fails
-    
     # Check if MODEL_CHOICE is set for contextual embeddings
     model_choice = os.getenv("MODEL_CHOICE")
-    use_contextual_embeddings = bool(model_choice)
-    
-    # Process in batches to avoid memory issues
-    for i in range(0, len(contents), batch_size):
-        batch_end = min(i + batch_size, len(contents))
-        
-        # Get batch slices
-        batch_urls = urls[i:batch_end]
-        batch_chunk_numbers = chunk_numbers[i:batch_end]
-        batch_contents = contents[i:batch_end]
-        batch_metadatas = metadatas[i:batch_end]
-        
-        # Apply contextual embedding to each chunk if MODEL_CHOICE is set
-        if use_contextual_embeddings:
-            # Prepare arguments for parallel processing
-            process_args = []
-            for j, content in enumerate(batch_contents):
-                url = batch_urls[j]
-                full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
-            
-            # Process in parallel using ThreadPoolExecutor
-            contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Submit all tasks and collect results
-                future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
-                                for idx, arg in enumerate(process_args)}
-                
-                # Process results as they complete
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        result, success = future.result()
-                        contextual_contents.append(result)
-                        if success:
-                            batch_metadatas[idx]["contextual_embedding"] = True
-                    except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
-                        # Use original content as fallback
-                        contextual_contents.append(batch_contents[idx])
-            
-            # Sort results back into original order if needed
-            if len(contextual_contents) != len(batch_contents):
-                print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
-                # Use original contents as fallback
-                contextual_contents = batch_contents
-        else:
-            # If not using contextual embeddings, use original contents
-            contextual_contents = batch_contents
-        
-        # Create embeddings for the entire batch at once
-        batch_embeddings = create_embeddings_batch(contextual_contents)
-        
-        batch_data = []
-        for j in range(len(contextual_contents)):
-            # Extract metadata fields
-            chunk_size = len(contextual_contents[j])
-            
-            # Prepare data for insertion
-            data = {
-                "url": batch_urls[j],
-                "chunk_number": batch_chunk_numbers[j],
-                "content": contextual_contents[j],  # Store original content
-                "metadata": {
-                    "chunk_size": chunk_size,
-                    **batch_metadatas[j]
-                },
-                "embedding": batch_embeddings[j]  # Use embedding from contextual content
-            }
-            
-            batch_data.append(data)
-        
-        # Insert batch into Supabase
-        try:
-            client.table("crawled_pages").insert(batch_data).execute()
-        except Exception as e:
-            print(f"Error inserting batch into Supabase: {e}")
+    use_contextual_embeddings = bool(model_choice and openai.api_key) # Check both env vars
 
-def search_documents(
-    client: Client, 
+    ids = []
+    documents_to_add = []
+    metadatas_to_add = []
+    
+    # Prepare data for batch processing
+    process_args = []
+    for i in range(len(contents)):
+        ids.append(f"{urls[i]}-{chunk_numbers[i]}") # Create unique ID for each chunk
+        full_document = url_to_full_document.get(urls[i], "")
+        process_args.append((urls[i], contents[i], full_document))
+        metadatas_to_add.append(metadatas[i]) # Add original metadata for now
+
+    # Apply contextual embedding to each chunk if enabled
+    if use_contextual_embeddings:
+        print("Generating contextual embeddings...")
+        contextual_results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all tasks and collect results
+            future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
+                            for idx, arg in enumerate(process_args)}
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    result, success = future.result()
+                    contextual_results.append((idx, result, success)) # Store index, result, success
+                except Exception as e:
+                    print(f"Error processing chunk {idx}: {e}")
+                    # Use original content as fallback
+                    contextual_results.append((idx, contents[idx], False)) # Store index, original content, False
+
+        # Sort results back into original order and update documents/metadata
+        contextual_results.sort(key=lambda x: x[0]) # Sort by original index
+        
+        for idx, contextual_text, success in contextual_results:
+            documents_to_add.append(contextual_text)
+            if success:
+                metadatas_to_add[idx]["contextual_embedding"] = True
+            else:
+                 metadatas_to_add[idx]["contextual_embedding"] = False # Explicitly mark if failed
+
+    else:
+        # If not using contextual embeddings, use original contents
+        documents_to_add = contents
+        # Ensure metadata still includes the flag, even if false
+        for meta in metadatas_to_add:
+             meta["contextual_embedding"] = False
+
+
+    if not documents_to_add:
+        print("No documents to add to ChromaDB.")
+        return
+
+    print(f"Adding {len(documents_to_add)} chunks to ChromaDB collection '{collection.name}'...")
+
+    # Add documents in batches
+    for batch_start in range(0, len(documents_to_add), batch_size):
+        batch_end = min(batch_start + batch_size, len(documents_to_add))
+        
+        collection.add(
+            ids=ids[batch_start:batch_end],
+            documents=documents_to_add[batch_start:batch_end],
+            metadatas=metadatas_to_add[batch_start:batch_end],
+            # Embeddings are generated automatically by the collection's embedding function
+        )
+    print(f"Successfully added {len(documents_to_add)} chunks to ChromaDB collection '{collection.name}'.")
+
+
+def search_documents_chroma(
+    collection: chromadb.Collection, 
     query: str, 
     match_count: int = 10, 
     filter_metadata: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
-    Search for documents in Supabase using vector similarity.
+    Search for documents in ChromaDB using vector similarity.
     
     Args:
-        client: Supabase client
+        collection: ChromaDB collection
         query: Query text
         match_count: Maximum number of results to return
         filter_metadata: Optional metadata filter
@@ -272,24 +245,28 @@ def search_documents(
     Returns:
         List of matching documents
     """
-    # Create embedding for the query
-    query_embedding = create_embedding(query)
-    
-    # Execute the search using the match_crawled_pages function
+    # Execute the search using the collection.query method
     try:
-        # Only include filter parameter if filter_metadata is provided and not empty
-        params = {
-            'query_embedding': query_embedding,
-            'match_count': match_count
-        }
+        # ChromaDB handles embedding the query text internally
+        results = collection.query(
+            query_texts=[query],
+            n_results=match_count,
+            where=filter_metadata, # Pass the dictionary directly
+            include=["documents", "metadatas", "distances"]
+        )
         
-        # Only add the filter if it's actually provided and not empty
-        if filter_metadata:
-            params['filter'] = filter_metadata  # Pass the dictionary directly, not JSON-encoded
+        # Format the results to match the expected output structure
+        formatted_results = []
+        if results and results.get("documents") and results["documents"][0]:
+             for i in range(len(results["documents"][0])):
+                 formatted_results.append({
+                     "url": results["metadatas"][0][i].get("url"), # Assuming URL is in metadata
+                     "content": results["documents"][0][i],
+                     "metadata": results["metadatas"][0][i],
+                     "similarity": 1 - results["distances"][0][i] # Convert distance to similarity (0 to 1)
+                 })
         
-        result = client.rpc('match_crawled_pages', params).execute()
-        
-        return result.data
+        return formatted_results
     except Exception as e:
-        print(f"Error searching documents: {e}")
+        print(f"Error searching documents in ChromaDB: {e}")
         return []

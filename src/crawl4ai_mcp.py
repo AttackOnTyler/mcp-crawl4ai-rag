@@ -12,16 +12,18 @@ from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, urldefrag
 from xml.etree import ElementTree
 from dotenv import load_dotenv
-from supabase import Client
+# Removed: from supabase import Client
 from pathlib import Path
 import requests
 import asyncio
 import json
 import os
 import re
+import chromadb # Added chromadb import
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
-from utils import get_supabase_client, add_documents_to_supabase, search_documents
+# Updated import from utils
+from utils import get_chroma_client, get_or_create_collection, add_documents_to_chroma, search_documents_chroma
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -35,7 +37,8 @@ load_dotenv(dotenv_path, override=True)
 class Crawl4AIContext:
     """Context for the Crawl4AI MCP server."""
     crawler: AsyncWebCrawler
-    supabase_client: Client
+    chroma_client: chromadb.PersistentClient # Changed to ChromaDB client
+    collection_name: str # Added collection name to context
     
 @asynccontextmanager
 async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
@@ -46,7 +49,7 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         server: The FastMCP server instance
         
     Yields:
-        Crawl4AIContext: The context containing the Crawl4AI crawler and Supabase client
+        Crawl4AIContext: The context containing the Crawl4AI crawler and ChromaDB client/collection
     """
     # Create browser configuration
     browser_config = BrowserConfig(
@@ -58,17 +61,21 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
     crawler = AsyncWebCrawler(config=browser_config)
     await crawler.__aenter__()
     
-    # Initialize Supabase client
-    supabase_client = get_supabase_client()
+    # Initialize ChromaDB client and get/create collection
+    chroma_client = get_chroma_client()
+    collection_name = os.getenv("CHROMA_COLLECTION_NAME", "crawled_docs") # Use env var for collection name, default to 'crawled_docs'
+    collection = get_or_create_collection(chroma_client, collection_name)
     
     try:
         yield Crawl4AIContext(
             crawler=crawler,
-            supabase_client=supabase_client
+            chroma_client=chroma_client, # Provided ChromaDB client
+            collection_name=collection_name # Provided collection name
         )
     finally:
         # Clean up the crawler
         await crawler.__aexit__(None, None, None)
+        # Note: ChromaDB client does not need explicit closing for PersistentClient
 
 # Initialize FastMCP server
 mcp = FastMCP(
@@ -125,50 +132,41 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
 
     return urls
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
-    """Split text into chunks, respecting code blocks and paragraphs."""
+# Replaced smart_chunk_markdown with the version from CRAWL4AI-AGENT-V2/insert_docs.py
+def smart_chunk_markdown(markdown: str, max_len: int = 1000) -> List[str]:
+    """Hierarchically splits markdown by #, ##, ### headers, then by characters, to ensure all chunks < max_len."""
+    def split_by_header(md, header_pattern):
+        indices = [m.start() for m in re.finditer(header_pattern, md, re.MULTILINE)]
+        indices.append(len(md))
+        return [md[indices[i]:indices[i+1]].strip() for i in range(len(indices)-1) if md[indices[i]:indices[i+1]].strip()]
+
     chunks = []
-    start = 0
-    text_length = len(text)
 
-    while start < text_length:
-        # Calculate end position
-        end = start + chunk_size
+    for h1 in split_by_header(markdown, r'^# .+$'):
+        if len(h1) > max_len:
+            for h2 in split_by_header(h1, r'^## .+$'):
+                if len(h2) > max_len:
+                    for h3 in split_by_header(h2, r'^### .+$'):
+                        if len(h3) > max_len:
+                            for i in range(0, len(h3), max_len):
+                                chunks.append(h3[i:i+max_len].strip())
+                        else:
+                            chunks.append(h3)
+                else:
+                    chunks.append(h2)
+        else:
+            chunks.append(h1)
 
-        # If we're at the end of the text, just take what's left
-        if end >= text_length:
-            chunks.append(text[start:].strip())
-            break
+    final_chunks = []
 
-        # Try to find a code block boundary first (```)
-        chunk = text[start:end]
-        code_block = chunk.rfind('```')
-        if code_block != -1 and code_block > chunk_size * 0.3:
-            end = start + code_block
+    for c in chunks:
+        if len(c) > max_len:
+            final_chunks.extend([c[i:i+max_len].strip() for i in range(0, len(c), max_len)])
+        else:
+            final_chunks.append(c)
 
-        # If no code block, try to break at a paragraph
-        elif '\n\n' in chunk:
-            # Find the last paragraph break
-            last_break = chunk.rfind('\n\n')
-            if last_break > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_break
+    return [c for c in final_chunks if c]
 
-        # If no paragraph break, try to break at a sentence
-        elif '. ' in chunk:
-            # Find the last sentence break
-            last_period = chunk.rfind('. ')
-            if last_period > chunk_size * 0.3:  # Only break if we're past 30% of chunk_size
-                end = start + last_period + 1
-
-        # Extract chunk and clean it up
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-
-        # Move start position for next chunk
-        start = end
-
-    return chunks
 
 def extract_section_info(chunk: str) -> Dict[str, Any]:
     """
@@ -192,23 +190,27 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
 @mcp.tool()
 async def crawl_single_page(ctx: Context, url: str) -> str:
     """
-    Crawl a single web page and store its content in Supabase.
+    Crawl a single web page and store its content in ChromaDB.
     
     This tool is ideal for quickly retrieving content from a specific URL without following links.
-    The content is stored in Supabase for later retrieval and querying.
+    The content is stored in ChromaDB for later retrieval and querying.
     
     Args:
         ctx: The MCP server provided context
         url: URL of the web page to crawl
     
     Returns:
-        Summary of the crawling operation and storage in Supabase
+        Summary of the crawling operation and storage in ChromaDB
     """
     try:
-        # Get the crawler from the context
+        # Get the crawler, ChromaDB client, and collection name from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        chroma_client = ctx.request_context.lifespan_context.chroma_client
+        collection_name = ctx.request_context.lifespan_context.collection_name
         
+        # Get the ChromaDB collection
+        collection = get_or_create_collection(chroma_client, collection_name)
+
         # Configure the crawl
         run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
         
@@ -216,10 +218,10 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         result = await crawler.arun(url=url, config=run_config)
         
         if result.success and result.markdown:
-            # Chunk the content
+            # Chunk the content (using the new smart_chunk_markdown)
             chunks = smart_chunk_markdown(result.markdown)
             
-            # Prepare data for Supabase
+            # Prepare data for ChromaDB
             urls = []
             chunk_numbers = []
             contents = []
@@ -241,8 +243,8 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             # Create url_to_full_document mapping
             url_to_full_document = {url: result.markdown}
             
-            # Add to Supabase
-            add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document)
+            # Add to ChromaDB
+            add_documents_to_chroma(collection, urls, chunk_numbers, contents, metadatas, url_to_full_document)
             
             return json.dumps({
                 "success": True,
@@ -268,16 +270,16 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 1000) -> str: # Changed default chunk_size to 1000
     """
-    Intelligently crawl a URL based on its type and store content in Supabase.
+    Intelligently crawl a URL based on its type and store content in ChromaDB.
     
     This tool automatically detects the URL type and applies the appropriate crawling method:
     - For sitemaps: Extracts and crawls all URLs in parallel
     - For text files (llms.txt): Directly retrieves the content
     - For regular webpages: Recursively crawls internal links up to the specified depth
     
-    All crawled content is chunked and stored in Supabase for later retrieval and querying.
+    All crawled content is chunked and stored in ChromaDB for later retrieval and querying.
     
     Args:
         ctx: The MCP server provided context
@@ -290,9 +292,13 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         JSON string with crawl summary and storage information
     """
     try:
-        # Get the crawler and Supabase client from the context
+        # Get the crawler, ChromaDB client, and collection name from the context
         crawler = ctx.request_context.lifespan_context.crawler
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        chroma_client = ctx.request_request.lifespan_context.chroma_client # Corrected typo here
+        collection_name = ctx.request_context.lifespan_context.collection_name
+
+        # Get the ChromaDB collection
+        collection = get_or_create_collection(chroma_client, collection_name)
         
         crawl_results = []
         crawl_type = "webpage"
@@ -315,6 +321,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             crawl_type = "sitemap"
         else:
             # For regular URLs, use recursive crawl
+            # Note: The original code used args.max_depth and args.max_concurrent which are not available here.
+            # Using the tool arguments max_depth and max_concurrent instead.
             crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
             crawl_type = "webpage"
         
@@ -325,7 +333,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "error": "No content found"
             }, indent=2)
         
-        # Process results and store in Supabase
+        # Process results and store in ChromaDB
         urls = []
         chunk_numbers = []
         contents = []
@@ -335,7 +343,8 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         for doc in crawl_results:
             source_url = doc['url']
             md = doc['markdown']
-            chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+            # Use the new smart_chunk_markdown with the tool's chunk_size
+            chunks = smart_chunk_markdown(md, max_len=chunk_size)
             
             for i, chunk in enumerate(chunks):
                 urls.append(source_url)
@@ -358,10 +367,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         for doc in crawl_results:
             url_to_full_document[doc['url']] = doc['markdown']
         
-        # Add to Supabase
+        # Add to ChromaDB
         # IMPORTANT: Adjust this batch size for more speed if you want! Just don't overwhelm your system or the embedding API ;)
-        batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+        batch_size = 100 # Increased batch size for ChromaDB
+        add_documents_to_chroma(collection, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
         
         return json.dumps({
             "success": True,
@@ -474,7 +483,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 @mcp.tool()
 async def get_available_sources(ctx: Context) -> str:
     """
-    Get all available sources based on unique source metadata values.
+    Get all available sources based on unique source metadata values from ChromaDB.
     
     This tool returns a list of all unique sources (domains) that have been crawled and stored
     in the database. This is useful for discovering what content is available for querying.
@@ -486,24 +495,24 @@ async def get_available_sources(ctx: Context) -> str:
         JSON string with the list of available sources
     """
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the ChromaDB client and collection name from the context
+        chroma_client = ctx.request_context.lifespan_context.chroma_client
+        collection_name = ctx.request_context.lifespan_context.collection_name
+
+        # Get the ChromaDB collection
+        collection = get_or_create_collection(chroma_client, collection_name)
         
-        # Use a direct query with the Supabase client
-        # This could be more efficient with a direct Postgres query but
-        # I don't want to require users to set a DB_URL environment variable as well
-        result = supabase_client.from_('crawled_pages')\
-            .select('metadata')\
-            .not_.is_('metadata->>source', 'null')\
-            .execute()
+        # Fetch all documents with metadata from the collection
+        # Note: This might be memory intensive for very large collections
+        results = collection.get(include=["metadatas"])
             
         # Use a set to efficiently track unique sources
         unique_sources = set()
         
-        # Extract the source values from the result using a set for uniqueness
-        if result.data:
-            for item in result.data:
-                source = item.get('metadata', {}).get('source')
+        # Extract the source values from the results
+        if results and results.get("metadatas"):
+            for metadata in results["metadatas"]:
+                source = metadata.get('source')
                 if source:
                     unique_sources.add(source)
         
@@ -524,7 +533,7 @@ async def get_available_sources(ctx: Context) -> str:
 @mcp.tool()
 async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
     """
-    Perform a RAG (Retrieval Augmented Generation) query on the stored content.
+    Perform a RAG (Retrieval Augmented Generation) query on the stored content in ChromaDB.
     
     This tool searches the vector database for content relevant to the query and returns
     the matching documents. Optionally filter by source domain.
@@ -541,38 +550,33 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         JSON string with the search results
     """
     try:
-        # Get the Supabase client from the context
-        supabase_client = ctx.request_context.lifespan_context.supabase_client
+        # Get the ChromaDB client and collection name from the context
+        chroma_client = ctx.request_context.lifespan_context.chroma_client
+        collection_name = ctx.request_context.lifespan_context.collection_name
+
+        # Get the ChromaDB collection
+        collection = get_or_create_collection(chroma_client, collection_name)
         
         # Prepare filter if source is provided and not empty
         filter_metadata = None
         if source and source.strip():
             filter_metadata = {"source": source}
         
-        # Perform the search
-        results = search_documents(
-            client=supabase_client,
+        # Perform the search using the new search_documents_chroma function
+        results = search_documents_chroma(
+            collection=collection,
             query=query,
             match_count=match_count,
             filter_metadata=filter_metadata
         )
         
-        # Format the results
-        formatted_results = []
-        for result in results:
-            formatted_results.append({
-                "url": result.get("url"),
-                "content": result.get("content"),
-                "metadata": result.get("metadata"),
-                "similarity": result.get("similarity")
-            })
-        
+        # The search_documents_chroma function already formats the results
         return json.dumps({
             "success": True,
             "query": query,
             "source_filter": source,
-            "results": formatted_results,
-            "count": len(formatted_results)
+            "results": results, # Use the already formatted results
+            "count": len(results)
         }, indent=2)
     except Exception as e:
         return json.dumps({
